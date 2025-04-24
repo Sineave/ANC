@@ -1,0 +1,283 @@
+import sounddevice as sd
+from queue import Queue
+import numpy as np
+import soundfile as sf
+import subprocess
+import os
+import threading
+import time
+from collections import deque
+from scipy.signal import butter, lfilter
+
+# Configuration
+sample_rate = 64000  # Best for RNNNoise
+duration = 20  # Recording duration
+sample_threshold = 32000  # Samples before processing
+silence_threshold = 1.5  # Seconds of silence before injecting filler
+silence_amplitude = 0.001  # Low-level background noise to avoid cutoffs
+chunk_duration = 0.1  # Duration of each audio chunk in seconds
+chunk_size = int(sample_rate * chunk_duration)
+lowpass_cutoff = 4000  # Low-pass filter cutoff frequency in Hz
+filter_order = 5  # Filter order for the low-pass filter
+gain_db = 10  # How much to boost the audio in decibels
+max_boost_before_clipping = 6.0  # Maximum boost before we apply normalization
+
+# Queues
+audio_queue = Queue(maxsize=10)  # Limit size to prevent memory issues
+processing_queue = Queue(maxsize=5)  # Queue for chunks ready for processing
+enhanced_audio_queue = Queue(maxsize=10)  # Queue for playback
+
+# File paths
+temp_noisy_file = "temp_noisy.wav"
+temp_pcm_file = "temp_noisy.pcm"
+enhanced_pcm_file = "enhanced_audio.pcm"
+enhanced_wav_file = "enhanced_audio.wav"
+raw_audio_file = "raw_input.wav"  # New file for saving raw input
+
+# Thread control flags
+capture_active = True
+processing_active = True
+playback_active = True
+
+# Audio statistics
+last_audio_time = time.time()
+audio_stats = {
+    'captured_chunks': 0,
+    'processed_chunks': 0,
+    'played_chunks': 0,
+    'silence_detected': 0
+}
+
+# Buffers for saving complete audio
+raw_audio_buffer = []
+enhanced_audio_buffer = []
+
+def apply_gain(audio_data, gain_db):
+    """Apply gain to audio data in dB"""
+    gain_linear = 10 ** (gain_db / 20)
+    boosted_audio = audio_data * gain_linear
+    
+    # Prevent clipping by normalizing if needed
+    max_val = np.max(np.abs(boosted_audio))
+    if max_val > 1.0:
+        print(f"[GAIN] Normalizing audio (max was {max_val:.2f})")
+        boosted_audio = boosted_audio / max_val
+        
+    return boosted_audio
+
+
+def butter_lowpass(cutoff, fs, order=5):
+    """Design a Butterworth low-pass filter"""
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+def lowpass_filter(data, cutoff=lowpass_cutoff, fs=sample_rate, order=filter_order):
+    """Apply low-pass filter to smooth audio"""
+    b, a = butter_lowpass(cutoff, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
+
+def capture_audio():
+    """Handles audio input capture in a dedicated thread."""
+    global last_audio_time, raw_audio_buffer
+    
+    def callback(indata, frames, time_info, status):
+        if status:
+            print(f"[WARNING] Audio status: {status}")
+
+        # Detect if input is NOT silence
+        if np.mean(np.abs(indata)) > silence_amplitude:
+            last_audio_time = time.time()
+            audio_stats['captured_chunks'] += 1
+        else:
+            audio_stats['silence_detected'] += 1
+
+        try:
+            # Split into fixed-size chunks for more consistent processing
+            for i in range(0, len(indata), chunk_size):
+                chunk = indata[i:i+chunk_size]
+                if len(chunk) == chunk_size:  # Only add full chunks
+                    audio_queue.put(chunk.copy())
+                    raw_audio_buffer.append(chunk.copy())  # Save to raw buffer
+        except Exception as e:
+            print(f"[CAPTURE ERROR] {e}")
+
+    print("[INFO] Starting audio capture thread...")
+    with sd.InputStream(
+        samplerate=sample_rate,
+        channels=1,
+        dtype='float32',
+        blocksize=chunk_size,
+        callback=callback
+    ):
+        while capture_active:
+            time.sleep(0.1)  # Prevent CPU overload
+
+    print("[INFO] Audio capture thread stopped.")
+
+def process_audio():
+    """Processes audio chunks for noise cancellation in a dedicated thread."""
+    global last_audio_time, enhanced_audio_buffer
+    
+    print("[INFO] Starting audio processing thread...")
+    
+    buffer = deque(maxlen=sample_threshold // chunk_size)
+    
+    while processing_active or not audio_queue.empty():
+        try:
+            # Get new audio chunk with timeout
+            chunk = audio_queue.get(timeout=0.1)
+            buffer.append(chunk)
+            
+            # Check if we have enough samples to process
+            total_samples = sum(chunk.shape[0] for chunk in buffer)
+            if total_samples >= sample_threshold:
+                print(f"[PROCESSING] Processing {total_samples} samples...")
+                combined_audio = np.concatenate(buffer)
+                buffer.clear()  # Clear buffer after processing
+                
+                # Apply gain boost before processing
+                boosted_audio = apply_gain(combined_audio, gain_db)
+                
+                # Save to temporary file
+                sf.write(temp_noisy_file, boosted_audio, sample_rate)
+                
+                # Rest of the existing processing code remains the same...
+                # Convert to PCM for RNNNoise
+                noisy_audio, sr = sf.read(temp_noisy_file)
+                noisy_audio_int16 = (noisy_audio * 32767).astype(np.int16)
+                with open(temp_pcm_file, "wb") as f:
+                    f.write(noisy_audio_int16.tobytes())
+
+                # Run RNNNoise
+                result = subprocess.run(
+                    ["rnnoise/examples/rnnoise_demo", temp_pcm_file, enhanced_pcm_file],
+                    capture_output=True,
+                    text=True
+                )
+                
+                if result.returncode != 0:
+                    print(f"[PROCESSING ERROR] RNNNoise failed: {result.stderr}")
+                    continue
+
+                # Read enhanced audio
+                enhanced_audio = np.fromfile(enhanced_pcm_file, dtype=np.int16) / 32767.0
+                if enhanced_audio.size == 0:
+                    print("[PROCESSING ERROR] Enhanced audio is empty!")
+                    continue
+
+                # Apply low-pass filter for smoothing
+                smoothed_audio = lowpass_filter(enhanced_audio)
+                
+                enhanced_audio_queue.put(smoothed_audio)
+                enhanced_audio_buffer.append(smoothed_audio)  # Save to enhanced buffer
+                audio_stats['processed_chunks'] += 1
+                last_audio_time = time.time()  # Reset silence timer
+                
+        except Exception as e:
+            if not isinstance(e, RuntimeError):  # Ignore queue empty timeout
+                print(f"[PROCESSING ERROR] {e}")
+    
+    print("[INFO] Audio processing thread stopped.")
+
+def playback_audio():
+    """Handles audio playback in a dedicated thread."""
+    global playback_active, last_audio_time
+    
+    print("[INFO] Starting audio playback thread...")
+    
+    while playback_active or not enhanced_audio_queue.empty():
+        try:
+            if not enhanced_audio_queue.empty():
+                enhanced_audio = enhanced_audio_queue.get(timeout=0.1)
+                print(f"[PLAYBACK] Playing {enhanced_audio.shape[0]} samples...")
+                sd.play(enhanced_audio, samplerate=sample_rate)
+                sd.wait()
+                audio_stats['played_chunks'] += 1
+            else:
+                # Check silence duration
+                silence_duration = time.time() - last_audio_time
+                if silence_duration >= silence_threshold:
+                    print(f"[PLAYBACK] Silence detected for {silence_duration:.2f}s, injecting silence...")
+                    silent_chunk = np.full((sample_threshold,), silence_amplitude, dtype=np.float32)
+                    sd.play(silent_chunk, samplerate=sample_rate)
+                    sd.wait()
+                
+        except Exception as e:
+            if not isinstance(e, RuntimeError):  # Ignore queue empty timeout
+                print(f"[PLAYBACK ERROR] {e}")
+    
+    print("[INFO] Audio playback thread stopped.")
+
+def monitor_threads():
+    """Monitors and displays thread status."""
+    while any([capture_active, processing_active, playback_active]):
+        print("\n=== System Status ===")
+        print(f"Capture Thread: {'Running' if capture_active else 'Stopped'}")
+        print(f"Processing Thread: {'Running' if processing_active else 'Stopped'}")
+        print(f"Playback Thread: {'Running' if playback_active else 'Stopped'}")
+        print("\n=== Audio Statistics ===")
+        print(f"Captured chunks: {audio_stats['captured_chunks']}")
+        print(f"Processed chunks: {audio_stats['processed_chunks']}")
+        print(f"Played chunks: {audio_stats['played_chunks']}")
+        print(f"Silence detected: {audio_stats['silence_detected']}")
+        print(f"Audio Queue size: {audio_queue.qsize()}")
+        print(f"Processing Queue size: {processing_queue.qsize()}")
+        print(f"Enhanced Queue size: {enhanced_audio_queue.qsize()}")
+        time.sleep(2)
+
+def save_audio_files():
+    """Save both raw and enhanced audio to WAV files."""
+    # Save raw audio
+    if raw_audio_buffer:
+        raw_audio = np.concatenate(raw_audio_buffer)
+        sf.write(raw_audio_file, raw_audio, sample_rate)
+        print(f"[SUCCESS] Raw input audio saved to {raw_audio_file}")
+    else:
+        print("[WARNING] No raw audio data to save.")
+    
+    # Save enhanced audio
+    if enhanced_audio_buffer:
+        enhanced_audio = np.concatenate(enhanced_audio_buffer)
+        sf.write(enhanced_wav_file, enhanced_audio, sample_rate)
+        print(f"[SUCCESS] Enhanced audio saved to {enhanced_wav_file}")
+    else:
+        print("[WARNING] No enhanced audio data to save.")
+
+# Start all threads
+capture_thread = threading.Thread(target=capture_audio, daemon=True)
+processing_thread = threading.Thread(target=process_audio, daemon=True)
+playback_thread = threading.Thread(target=playback_audio, daemon=True)
+monitor_thread = threading.Thread(target=monitor_threads, daemon=True)
+
+capture_thread.start()
+processing_thread.start()
+playback_thread.start()
+monitor_thread.start()
+
+# Main thread waits for specified duration
+print(f"[MAIN] Running for {duration} seconds...")
+time.sleep(duration)
+
+# Stop threads gracefully
+print("[MAIN] Stopping threads...")
+capture_active = False
+processing_active = False
+
+# Wait for queues to empty
+while not audio_queue.empty() or not processing_queue.empty():
+    time.sleep(0.1)
+
+playback_active = False
+
+# Wait for threads to finish
+capture_thread.join()
+processing_thread.join()
+playback_thread.join()
+
+# Save all audio data
+save_audio_files()
+
+print("[MAIN] Program completed.")

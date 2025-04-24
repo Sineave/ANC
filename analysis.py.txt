@@ -1,0 +1,143 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.io import wavfile
+from scipy.signal import stft, find_peaks
+
+def plot_spectrogram(audio_file, title, save_path=None):
+    """Plot spectrogram using STFT and optionally save it."""
+    sr, y = wavfile.read(audio_file)
+
+    # Stereo to mono
+    if y.ndim > 1:
+        y = y.mean(axis=1)
+
+    # Normalize if int16
+    if y.dtype == np.int16:
+        y = y / 32768.0
+
+    # Limit to first 10 seconds
+    max_seconds = 10
+    y = y[:sr * max_seconds]
+
+    # Compute STFT
+    f, t, Zxx = stft(y, fs=sr, nperseg=512)
+    Sxx_db = 20 * np.log10(np.abs(Zxx) + 1e-10)
+
+    # Plot
+    plt.figure(figsize=(12, 6))
+    plt.pcolormesh(t, f, Sxx_db, shading='gouraud')
+    plt.title(title)
+    plt.ylabel('Frequency [Hz]')
+    plt.xlabel('Time [s]')
+    plt.colorbar(label='Amplitude [dB]')
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+
+def plot_waveform(audio_file, title, save_path=None):
+    """Plot waveform and optionally save it."""
+    sr, y = wavfile.read(audio_file)
+    
+    # Normalize if int16
+    if y.dtype == np.int16:
+        y = y / 32768.0
+    
+    duration = len(y) / sr
+    time = np.linspace(0, duration, len(y))
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(time, y)
+    plt.title(title)
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+def compare_audio_quality(raw_audio_path, enhanced_audio_path):
+    """Compare raw and enhanced audio using various metrics."""
+    sr_raw, raw = wavfile.read(raw_audio_path)
+    sr_enh, enh = wavfile.read(enhanced_audio_path)
+
+    if sr_raw != sr_enh:
+        raise ValueError("Sample rates don't match!")
+
+    if raw.dtype == np.int16:
+        raw = raw / 32768.0
+    if enh.dtype == np.int16:
+        enh = enh / 32768.0
+
+    min_len = min(len(raw), len(enh))
+    raw = raw[:min_len]
+    enh = enh[:min_len]
+
+    zero_crossings_raw = np.mean(np.diff(np.signbit(raw)) != 0)
+    zero_crossings_enh = np.mean(np.diff(np.signbit(enh)) != 0)
+
+    results = {
+        'snr_raw_to_enhanced': calculate_snr(enh, raw),
+        'rms_raw': np.sqrt(np.mean(raw ** 2)),
+        'rms_enhanced': np.sqrt(np.mean(enh ** 2)),
+        'dynamic_range_raw': np.max(np.abs(raw)) - np.min(np.abs(raw)),
+        'dynamic_range_enhanced': np.max(np.abs(enh)) - np.min(np.abs(enh)),
+        'zero_crossing_raw': zero_crossings_raw,
+        'zero_crossing_enhanced': zero_crossings_enh
+    }
+
+    return results
+
+def process_audio_file(audio_path, label):
+    """Generate and save waveform and spectrogram plots."""
+    plot_spectrogram(audio_path, f"Spectrogram of {label.title()} Audio", save_path=f"spectrograms/{label}_spectrogram.png")
+    print(f"[INFO] Saved {label} audio spectrogram to spectrograms/{label}_spectrogram.png")
+
+    plot_waveform(audio_path, f"Waveform of {label.title()} Audio", save_path=f"waveforms/{label}_waveform.png")
+    print(f"[INFO] Saved {label} audio waveform to waveforms/{label}_waveform.png")
+
+# Setup directories
+os.makedirs("spectrograms", exist_ok=True)
+os.makedirs("waveforms", exist_ok=True)
+os.makedirs("results", exist_ok=True)
+
+raw_path = "raw_input.wav"
+enhanced_path = "enhanced_audio.wav"
+
+if os.path.exists(raw_path):
+    process_audio_file(raw_path, "raw")
+
+if os.path.exists(enhanced_path):
+    process_audio_file(enhanced_path, "enhanced")
+
+if os.path.exists(raw_path) and os.path.exists(enhanced_path):
+    results = compare_audio_quality(raw_path, enhanced_path)
+
+    print("\nAudio Quality Comparison Results:")
+    print(f"RMS Level - Raw: {results['rms_raw']:.4f}, Enhanced: {results['rms_enhanced']:.4f}")
+    print(f"Dynamic Range - Raw: {results['dynamic_range_raw']:.4f}, Enhanced: {results['dynamic_range_enhanced']:.4f}")
+    print(f"Zero Crossing Rate - Raw: {results['zero_crossing_raw']:.4f}, Enhanced: {results['zero_crossing_enhanced']:.4f}")
+
+    with open("results/audio_comparison.txt", "w") as f:
+        f.write("Audio Quality Comparison Results\n")
+        f.write("=" * 40 + "\n")
+        f.write(f"Raw Audio: {raw_path}\n")
+        f.write(f"Enhanced Audio: {enhanced_path}\n\n")
+        f.write(f"RMS Level - Raw: {results['rms_raw']:.4f}\n")
+        f.write(f"RMS Level - Enhanced: {results['rms_enhanced']:.4f}\n")
+        f.write(f"Dynamic Range - Raw: {results['dynamic_range_raw']:.4f}\n")
+        f.write(f"Dynamic Range - Enhanced: {results['dynamic_range_enhanced']:.4f}\n")
+        f.write(f"Zero Crossing Rate - Raw: {results['zero_crossing_raw']:.4f}\n")
+        f.write(f"Zero Crossing Rate - Enhanced: {results['zero_crossing_enhanced']:.4f}\n")
+
+    print(f"\n[INFO] Saved comparison results to results/audio_comparison.txt")
+else:
+    print("[WARNING] Could not compare audio files - one or both files missing.")
