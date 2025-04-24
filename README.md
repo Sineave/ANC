@@ -41,7 +41,7 @@ It showcases the integration of **Recurrent Neural Networks (GRUs)** for efficie
 
 ## 📜 License and Attribution
 
-This project uses [RNNoise](https://github.com/xiph/rnnoise), an open-source noise suppression library developed by Jean-Marc Valin at Xiph.Org.
+This project uses [RNNoise](https://github.com/xiph/rnnoise), an open-source noise suppression library.
 
 RNNoise is licensed under the BSD 3-Clause License. You can find the full license text [here](https://github.com/xiph/rnnoise/blob/main/COPYING).
 
